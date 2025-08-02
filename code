@@ -1,0 +1,127 @@
+import can
+import time
+import struct
+
+# ----------------------- CAN SETUP -----------------------
+
+def setup_can_interface():
+    """
+    Setup CAN interface over serial port /dev/ttyS0 at 500kbps.
+    """
+    try:
+        bus = can.Bus(interface='serial', channel='/dev/ttyS0', bitrate=500000)
+        print("[INFO] Connected to CAN bus at /dev/ttyS0 (500 kbps).")
+        return bus
+    except Exception as e:
+        print(f"[ERROR] Failed to setup CAN bus: {e}")
+        return None
+# ---------------------- SEND REQUEST ----------------------
+
+def send_fc_request(bus, output_request=1800, fc_start=1):
+    """
+    Send CAN message to start/stop Fuel Cell to ID 0x3C1.
+    :param output_request: 16-bit unsigned integer (0–65535)
+    :param fc_start: 0 = Stop, 1 = Start
+    """
+    if not (0 <= output_request <= 65535):
+        print("[ERROR] Invalid Output Request value.")
+        return
+
+    if fc_start not in (0, 1):
+        print("[ERROR] FC Start (FCCMD) must be 0 or 1.")
+        return
+
+    # Build CAN data: 2 bytes for output request, 2 bytes padding, 1 byte FCCMD, 3 bytes padding
+    data = struct.pack('<H2xB3x', output_request, fc_start)
+    
+    msg = can.Message(arbitration_id=0x3C1, data=data, is_extended_id=False)
+
+    try:
+        bus.send(msg)
+        print(f"\n[TX] Sent FC Command:")
+        print(f"  ➤ Output Request : {output_request}")
+        print(f"  ➤ FCCMD          : {fc_start} ({'Start' if fc_start else 'Stop'})")
+        print(f"  ➤ Raw Data       : {data.hex(' ')}")
+    except can.CanError as e:
+        print(f"[ERROR] Failed to send message: {e}")
+# ---------------------- DECODE 0x441 ----------------------
+
+def decode_fc_response(data):
+    """
+    Decode response from FC (CAN ID 0x441).
+    Includes control state and all bit-based ON/OFF statuses.
+    """
+    if len(data) < 8:
+        print("[WARN] Incomplete 0x441 message.")
+        return
+
+    # Extract numerical fields
+    system_output = int.from_bytes(data[0:2], 'little')
+    upper_limit = int.from_bytes(data[2:4], 'little')
+    control_state = data[4]
+    fc_state = data[5]
+
+    # Control State Lookup
+    state_lookup = {
+        0: "Sleep", 1: "Stopped", 2: "Start Processing",
+        3: "Power Supply Available", 4: "Stop Processing",
+        5: "Error Stopped", 6: "Service Mode", 7: "Idle"
+    }
+print(f"\n[RX] 0x441 Response Decoded:")
+    print(f"  ➤ System Output Value     : {system_output}")
+    print(f"  ➤ Output Upper Limit      : {upper_limit}")
+    print(f"  ➤ Control State           : {control_state} ({state_lookup.get(control_state, 'Unknown')})")
+    print(f"  ➤ FC State                : {fc_state} ({'ON' if fc_state else 'OFF'})")
+
+    # Parse flag bits starting from Bit 40 onward
+    # Byte 5 = bits 40–47
+    flags_40_47 = {
+        "Emergency_switch_state":     (data[5] >> 0) & 1,
+        "FC_output_limit_by_overheat": (data[5] >> 2) & 1,
+        "FC_output_limit_by_cellvol":  (data[5] >> 3) & 1,
+        "Warning(D4)":                (data[5] >> 4) & 1,
+        "Power_generation_restricted(D3)": (data[5] >> 5) & 1,
+        "Power_generation_stopped(D2)":    (data[5] >> 6) & 1,
+        "System_shutdown(D1)":             (data[5] >> 7) & 1
+    }
+
+    print("  ➤ Status Flags:")
+    for label, value in flags_40_47.items():
+        print(f"    - {label:35}: {'ON' if value else 'OFF'}")
+# --------------------- LISTEN FOR 0x441 ---------------------
+
+def listen_to_fc(bus, timeout=10):
+    """
+    Listen for messages from FC (ID 0x441) and decode them.
+    Exits if no message received for 'timeout' seconds.
+    """
+    print(f"\n[INFO] Listening for 0x441 for up to {timeout} seconds...\n")
+    start = time.time()
+
+    while True:
+        msg = bus.recv(1.0)  # 1s timeout per recv
+        if msg:
+            if msg.arbitration_id == 0x441:
+                decode_fc_response(msg.data)
+                start = time.time()  # reset timeout
+            else:
+                print(f"[RX] Ignored ID: 0x{msg.arbitration_id:03X}")
+        else:
+            if time.time() - start > timeout:
+                print(f"[TIMEOUT] No 0x441 response for {timeout} seconds. Stopping.")
+                break
+# --------------------- MAIN ---------------------
+
+if __name__ == "__main__":
+    bus = setup_can_interface()
+    if not bus:
+        exit(1)
+
+    # Send FC Start command
+    send_fc_request(bus, output_request=1800, fc_start=1)
+
+    # Listen for FC response (0x441)
+    listen_to_fc(bus, timeout=10)
+
+    bus.shutdown()
+    print("[INFO] CAN interface shut down.")
